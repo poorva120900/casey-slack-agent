@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from notion_client import Client
 from jira import JIRA
 from groq import Groq
+import embedder  # RAG layer
 
 load_dotenv(override=True)
 
@@ -26,88 +27,83 @@ groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
 
-# ── Notion: fetch all vendors ───────────────────────────────────────
+# ── Data fetchers ────────────────────────────────────────────────────
+
+
 def get_all_vendors():
     results = notion.databases.query(database_id=DATABASE_ID)
-    pages = results.get("results", [])
-
     vendors = []
-    for page in pages:
+    for page in results.get("results", []):
         props = page["properties"]
-        name = (
-            props["Vendor Name"]["title"][0]["plain_text"]
-            if props["Vendor Name"]["title"]
-            else ""
-        )
-        status = (
-            props["Contract Status"]["select"]["name"]
-            if props["Contract Status"]["select"]
-            else ""
-        )
-        deliverable = (
-            props["Deliverable"]["rich_text"][0]["plain_text"]
-            if props["Deliverable"]["rich_text"]
-            else ""
-        )
-        due_date = (
-            props["Due Date"]["rich_text"][0]["plain_text"]
-            if props["Due Date"]["rich_text"]
-            else ""
-        )
-        notes = (
-            props["Notes"]["rich_text"][0]["plain_text"]
-            if props["Notes"]["rich_text"]
-            else ""
-        )
         vendors.append(
             {
-                "name": name,
-                "status": status,
-                "deliverable": deliverable,
-                "due_date": due_date,
-                "notes": notes,
+                "name": props["Vendor Name"]["title"][0]["plain_text"]
+                if props["Vendor Name"]["title"]
+                else "",
+                "status": props["Contract Status"]["select"]["name"]
+                if props["Contract Status"]["select"]
+                else "",
+                "deliverable": props["Deliverable"]["rich_text"][0]["plain_text"]
+                if props["Deliverable"]["rich_text"]
+                else "",
+                "due_date": props["Due Date"]["rich_text"][0]["plain_text"]
+                if props["Due Date"]["rich_text"]
+                else "",
+                "notes": props["Notes"]["rich_text"][0]["plain_text"]
+                if props["Notes"]["rich_text"]
+                else "",
             }
         )
     return vendors
 
 
-# ── Jira: fetch all sprint tickets ──────────────────────────────────
 def get_all_tickets():
     issues = jira.search_issues(
         'updated >= "-365d" ORDER BY updated DESC', maxResults=50
     )
-    tickets = []
-    for issue in issues:
-        tickets.append(
-            {
-                "key": issue.key,
-                "summary": issue.fields.summary,
-                "status": issue.fields.status.name,
-                "priority": issue.fields.priority.name
-                if issue.fields.priority
-                else "None",
-            }
-        )
-    return tickets
+    return [
+        {
+            "key": issue.key,
+            "summary": issue.fields.summary,
+            "status": issue.fields.status.name,
+            "priority": issue.fields.priority.name if issue.fields.priority else "None",
+        }
+        for issue in issues
+    ]
 
 
-# ── Groq: understand the question and answer using real data ───────
-def ask_casey(question):
-    vendors = get_all_vendors()
-    tickets = get_all_tickets()
+def refresh_index():
+    """Re-fetch from Notion + Jira and rebuild the vector index."""
+    print("[casey] Refreshing vector index...")
+    embedder.index_data(get_all_vendors(), get_all_tickets())
 
-    system_prompt = f"""You are Casey, a helpful Slack agent for a Business Analyst.
-You have access to two data sources:
 
-VENDOR DATA (from Notion):
-{vendors}
+# ── RAG-powered answer ───────────────────────────────────────────────
 
-SPRINT TICKETS (from Jira):
-{tickets}
 
-Answer the user's question using ONLY the data above. Be concise and use Slack-friendly formatting
-(use *bold* for emphasis, bullet points with "-"). If the question relates to both vendors and
-sprint tickets, combine relevant info from both. If you don't have enough data to answer, say so honestly.
+def ask_casey(question: str) -> str:
+    from datetime import date
+
+    today = date.today().strftime("%B %d, %Y")
+
+    # Semantic search: retrieve only the most relevant docs
+    relevant_docs = embedder.search(question, top_k=6)
+
+    if not relevant_docs:
+        return "I don't have enough indexed data to answer that. Try asking me again in a moment."
+
+    context = "\n".join(f"- {doc}" for doc in relevant_docs)
+
+    system_prompt = f"""You are Casey, a helpful Slack assistant for a Business Analyst.
+Today's date is {today}.
+
+The following documents were retrieved as most relevant to the user's question
+(via semantic search over vendor and sprint ticket data):
+
+{context}
+
+Answer using ONLY the information above. Be concise and use Slack-friendly formatting
+(*bold* for emphasis, bullet points with "-"). If the data isn't sufficient, say so honestly.
 """
 
     response = groq_client.chat.completions.create(
@@ -118,11 +114,12 @@ sprint tickets, combine relevant info from both. If you don't have enough data t
         ],
         temperature=0.3,
     )
-
     return response.choices[0].message.content
 
 
-# ── Slack handlers ──────────────────────────────────────────────────
+# ── Slack handlers ───────────────────────────────────────────────────
+
+
 @app.message("hello")
 def say_hello(message, say):
     say(
@@ -134,6 +131,13 @@ def say_hello(message, say):
     )
 
 
+@app.message("refresh")
+def handle_refresh(message, say):
+    say("Refreshing my knowledge base... 🔄")
+    refresh_index()
+    say("Done! I'm up to date with the latest Notion and Jira data. ✅")
+
+
 @app.message("")
 def handle_message(message, say):
     text = message["text"]
@@ -142,7 +146,12 @@ def handle_message(message, say):
     say(answer)
 
 
+# ── Startup ──────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
+    print("Building vector index from Notion + Jira data...")
+    refresh_index()
+
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     print("Casey is running!")
     handler.start()
