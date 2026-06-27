@@ -46,7 +46,7 @@ def index_data(vendors: list[dict], tickets: list[dict]) -> None:
         )
         docs.append(text)
         ids.append(f"vendor_{i}")
-        metadatas.append({"type": "vendor", "name": v["name"]})
+        metadatas.append({"type": "vendor", "name": v["name"], "status": v["status"]})
 
     for i, t in enumerate(tickets):
         text = (
@@ -85,3 +85,17 @@ def search(query: str, top_k: int = 10) -> list[str]:
         n_results=min(top_k, count),
     )
     return results["documents"][0] if results["documents"] else []
+
+
+def get_by_status(status: str) -> list[str]:
+    """
+    Fetch all vendor documents that match a specific contract status
+    (e.g. 'Expired', 'Pending', 'Active') using ChromaDB metadata filtering.
+    Only vendors have a 'status' field in metadata, so no type filter needed.
+    """
+    results = collection.get(
+        where={"status": {"$eq": status}}
+    )
+    docs = results.get("documents", [])
+    print(f"[embedder] get_by_status('{status}') found {len(docs)} docs")
+    return docs if docs else []

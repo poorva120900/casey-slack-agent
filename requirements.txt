@@ -3,3 +3,6 @@ python-dotenv
 notion-client
 jira
 groq
+chromadb
+sentence-transformers
+apscheduler
