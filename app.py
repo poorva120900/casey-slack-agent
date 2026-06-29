@@ -1,260 +1,387 @@
 import os
+import json
 from datetime import datetime, date
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from dotenv import load_dotenv
-from notion_client import Client
-from jira import JIRA
 from groq import Groq
 from apscheduler.schedulers.background import BackgroundScheduler
-import embedder  # RAG layer
+
+# Reuse the same data functions as the MCP server — single source of truth
+from mcp_server import _fetch_vendors, _fetch_tickets
 
 load_dotenv(override=True)
 
 # Slack setup
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
-ALERT_CHANNEL = "C0BDP3SUGTT"  # channel where proactive alerts are posted
-
-# Notion setup
-notion = Client(auth=os.environ["NOTION_TOKEN"])
-DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
-
-# Jira setup
-jira = JIRA(
-    server=os.environ["JIRA_URL"],
-    basic_auth=(os.environ["JIRA_EMAIL"], os.environ["JIRA_API_TOKEN"]),
-)
+ALERT_CHANNEL = "C0BDP3SUGTT"
 
 # Groq setup
 groq_client = Groq(api_key=os.environ["GROQ_API_KEY"])
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "openai/gpt-oss-120b"  # Groq's recommended model for tool use (replaces llama-3.3-70b-versatile)
 
 # Conversation memory — keyed by Slack thread_ts
-# Each thread gets its own list of {"role": ..., "content": ...} dicts
 conversation_memory = {}
-MAX_HISTORY = 10  # max turns to keep per thread (avoids token overflow)
+MAX_HISTORY = 10
 
 
-# ── Data fetchers ────────────────────────────────────────────────────
+# ── Groq Tool Definitions (mirror MCP server tools) ──────────────────
+# These tell Groq what tools Casey has available so it can decide
+# which one(s) to call based on the user's question.
 
-def get_all_vendors():
-    results = notion.databases.query(database_id=DATABASE_ID)
-    vendors = []
-    for page in results.get("results", []):
-        props = page["properties"]
-        vendors.append({
-            "name":        props["Vendor Name"]["title"][0]["plain_text"] if props["Vendor Name"]["title"] else "",
-            "status":      props["Contract Status"]["select"]["name"] if props["Contract Status"]["select"] else "",
-            "deliverable": props["Deliverable"]["rich_text"][0]["plain_text"] if props["Deliverable"]["rich_text"] else "",
-            "due_date":    props["Due Date"]["rich_text"][0]["plain_text"] if props["Due Date"]["rich_text"] else "",
-            "notes":       props["Notes"]["rich_text"][0]["plain_text"] if props["Notes"]["rich_text"] else "",
-        })
-    return vendors
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_all_vendors",
+            "description": (
+                "Retrieve all vendors from the Notion database. "
+                "Returns name, contract status, deliverable, due date, and notes for each vendor. "
+                "Use for general vendor questions or when you need the full picture."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_vendors_by_status",
+            "description": (
+                "Retrieve vendors filtered by contract status. "
+                "Use this when the question specifically asks about Active, Expired, or Pending vendors."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "description": "Contract status to filter by.",
+                        "enum": ["Active", "Expired", "Pending"],
+                    }
+                },
+                "required": ["status"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_all_tickets",
+            "description": (
+                "Retrieve all active sprint tickets from Jira. "
+                "Returns key, summary, status, and priority for each ticket. "
+                "Use for general sprint or ticket questions."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_blocked_tickets",
+            "description": (
+                "Retrieve all Jira tickets that are blocked. "
+                "Use when the question is about blockers, blocked work, or what's holding up the sprint."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_overdue_vendors",
+            "description": (
+                "Retrieve all vendors whose deliverable due date has already passed "
+                "and whose contract is not already marked as Expired. "
+                "Use when the question is about overdue, late, or missed deliverables."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+]
 
 
-def get_all_tickets():
-    issues = jira.search_issues('updated >= "-365d" ORDER BY updated DESC', maxResults=50)
-    return [
-        {
-            "key":      issue.key,
-            "summary":  issue.fields.summary,
-            "status":   issue.fields.status.name,
-            "priority": issue.fields.priority.name if issue.fields.priority else "None",
-        }
-        for issue in issues
-    ]
+# ── Tool Execution ────────────────────────────────────────────────────
+# When Groq decides to call a tool, this function runs the actual logic
+# using the same data functions as the MCP server.
 
 
-def refresh_index():
-    """Re-fetch from Notion + Jira and rebuild the vector index."""
-    print("[casey] Refreshing vector index...")
-    embedder.index_data(get_all_vendors(), get_all_tickets())
+def execute_tool(name: str, args: dict) -> list:
+    if name == "get_all_vendors":
+        return _fetch_vendors()
+
+    elif name == "get_vendors_by_status":
+        status = args.get("status", "Active")
+        return [v for v in _fetch_vendors() if v["status"].lower() == status.lower()]
+
+    elif name == "get_all_tickets":
+        return _fetch_tickets()
+
+    elif name == "get_blocked_tickets":
+        return [
+            t
+            for t in _fetch_tickets()
+            if "blocked" in t["summary"].lower() or "blocked" in t["status"].lower()
+        ]
+
+    elif name == "get_overdue_vendors":
+        today = date.today()
+        current_year = today.year
+        overdue = []
+        for v in _fetch_vendors():
+            if v["due_date"] and v["status"] != "Expired":
+                try:
+                    due = datetime.strptime(
+                        f"{v['due_date']} {current_year}", "%B %d %Y"
+                    ).date()
+                    if due < today:
+                        overdue.append(v)
+                except ValueError:
+                    pass
+        return overdue
+
+    return []
+
+
+# ── Agentic Q&A ───────────────────────────────────────────────────────
+# Groq function calling loop:
+# 1. Send question + tool definitions to Groq
+# 2. Groq decides which tool(s) to call
+# 3. Execute the tool(s) and return results to Groq
+# 4. Groq uses the real data to generate a final answer
+# 5. Repeat if Groq wants to call more tools (max 5 iterations)
+
+
+def ask_casey(question: str, history: list = []) -> str:
+    today = date.today().strftime("%B %d, %Y")
+
+    system_prompt = f"""You are Casey, a helpful Slack assistant for a Business Analyst.
+Today's date is {today}.
+
+You have tools that fetch real-time data from Notion (vendor database) and Jira (sprint tickets).
+- Use the most specific tool for the question (e.g. get_blocked_tickets instead of get_all_tickets when asked about blockers).
+- Call multiple tools if the question spans both vendors and tickets.
+- After getting results, give a concise answer using Slack-friendly formatting (*bold*, bullet points with "-").
+- Use the conversation history to understand references like "they" or "those vendors".
+"""
+
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": question})
+
+    # Agentic loop
+    for iteration in range(5):
+        response = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            temperature=0.3,
+        )
+
+        msg = response.choices[0].message
+
+        # No tool calls — Groq has enough info to answer
+        if not msg.tool_calls:
+            return msg.content
+
+        # Add Groq's tool call decision to message history (must be a plain dict)
+        messages.append(
+            {
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ],
+            }
+        )
+
+        # Execute each tool Groq requested
+        for tool_call in msg.tool_calls:
+            name = tool_call.function.name
+            args = (
+                json.loads(tool_call.function.arguments)
+                if tool_call.function.arguments
+                else {}
+            )
+            print(f"[agent] → {name}({args if args else ''})")
+            result = execute_tool(name, args)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": json.dumps(result),
+                }
+            )
+
+    return "I wasn't able to complete that. Please try again."
 
 
 # ── Block Kit helpers ────────────────────────────────────────────────
 
+
 def build_alert_blocks(today_str, expired, overdue, blocked):
-    """Build a rich Slack Block Kit message for proactive alerts."""
     blocks = [
         {
             "type": "header",
-            "text": {"type": "plain_text", "text": f"🤖 Casey's Daily Alert — {today_str}", "emoji": True},
+            "text": {
+                "type": "plain_text",
+                "text": f"🤖 Casey's Daily Alert — {today_str}",
+                "emoji": True,
+            },
         },
         {"type": "divider"},
     ]
 
     if expired:
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"🚨 *Expired Contracts — {len(expired)} vendor(s)*"},
-        })
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": "\n".join(f"• *{v['name']}* — {v['deliverable']}" for v in expired)},
-        })
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"🚨 *Expired Contracts — {len(expired)} vendor(s)*",
+                },
+            }
+        )
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "\n".join(
+                        f"• *{v['name']}* — {v['deliverable']}" for v in expired
+                    ),
+                },
+            }
+        )
         blocks.append({"type": "divider"})
 
     if overdue:
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"⚠️ *Overdue Deliverables — {len(overdue)} item(s)*"},
-        })
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": "\n".join(overdue)},
-        })
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"⚠️ *Overdue Deliverables — {len(overdue)} item(s)*",
+                },
+            }
+        )
+        blocks.append(
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "\n".join(overdue)},
+            }
+        )
         blocks.append({"type": "divider"})
 
     if blocked:
-        blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"🔴 *Blocked Tickets — {len(blocked)} ticket(s)*"},
-        })
-        blocks.append({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": "\n".join(
-                    f"• *{t['key']}* — {t['summary']} ({t['status']}, {t['priority']} priority)"
-                    for t in blocked
-                ),
-            },
-        })
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"🔴 *Blocked Tickets — {len(blocked)} ticket(s)*",
+                },
+            }
+        )
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "\n".join(
+                        f"• *{t['key']}* — {t['summary']} ({t['status']}, {t['priority']} priority)"
+                        for t in blocked
+                    ),
+                },
+            }
+        )
 
-    blocks.append({
-        "type": "context",
-        "elements": [{"type": "mrkdwn", "text": f"_Casey checks automatically every hour · Next check in ~60 min_"}],
-    })
+    blocks.append(
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": "_Casey checks automatically every hour · Next check in ~60 min_",
+                }
+            ],
+        }
+    )
 
     return blocks
 
 
 # ── Proactive alerts ─────────────────────────────────────────────────
 
+
 def run_alerts():
-    """
-    Checks for: expired contracts, overdue deliverables, blocked tickets.
-    Posts a summary to the Slack alert channel if issues are found.
-    Runs on a schedule via APScheduler.
-    """
     print("[alerts] Running alert check...")
     today = date.today()
     current_year = today.year
-    alerts = []
 
-    vendors = get_all_vendors()
-    tickets = get_all_tickets()
+    vendors = _fetch_vendors()
+    tickets = _fetch_tickets()
 
-    # 1. Expired contracts
     expired = [v for v in vendors if v["status"] == "Expired"]
-    if expired:
-        lines = "\n".join(f"- {v['name']} ({v['deliverable']})" for v in expired)
-        alerts.append(f"🚨 *Expired Contracts ({len(expired)}):*\n{lines}")
 
-    # 2. Overdue deliverables (due date has passed, contract not already expired)
     overdue = []
     for v in vendors:
         if v["due_date"] and v["status"] != "Expired":
             try:
-                due = datetime.strptime(f"{v['due_date']} {current_year}", "%B %d %Y").date()
+                due = datetime.strptime(
+                    f"{v['due_date']} {current_year}", "%B %d %Y"
+                ).date()
                 if due < today:
-                    overdue.append(f"- {v['name']}: {v['deliverable']} (was due {v['due_date']})")
+                    overdue.append(
+                        f"- {v['name']}: {v['deliverable']} (was due {v['due_date']})"
+                    )
             except ValueError:
-                pass  # skip unparseable dates
-    if overdue:
-        alerts.append(f"⚠️ *Overdue Deliverables ({len(overdue)}):*\n" + "\n".join(overdue))
+                pass
 
-    # 3. Blocked tickets
     blocked = [
-        t for t in tickets
+        t
+        for t in tickets
         if "blocked" in t["summary"].lower() or "blocked" in t["status"].lower()
     ]
-    if blocked:
-        lines = "\n".join(f"- {t['key']}: {t['summary']} ({t['status']}, {t['priority']} priority)" for t in blocked)
-        alerts.append(f"🔴 *Blocked Tickets ({len(blocked)}):*\n{lines}")
 
-    # Post to Slack using Block Kit if there's anything to report
     if any([expired, overdue, blocked]):
-        blocks = build_alert_blocks(today.strftime("%B %d, %Y"), expired, overdue, blocked)
+        blocks = build_alert_blocks(
+            today.strftime("%B %d, %Y"), expired, overdue, blocked
+        )
         app.client.chat_postMessage(
             channel=ALERT_CHANNEL,
-            text=f"Casey's Daily Alert — {today.strftime('%B %d, %Y')}",  # fallback for notifications
+            text=f"Casey's Daily Alert — {today.strftime('%B %d, %Y')}",
             blocks=blocks,
         )
-        print(f"[alerts] Posted Block Kit alert ({len(expired)} expired, {len(overdue)} overdue, {len(blocked)} blocked)")
+        print(
+            f"[alerts] Posted Block Kit alert ({len(expired)} expired, {len(overdue)} overdue, {len(blocked)} blocked)"
+        )
     else:
         print("[alerts] All clear — nothing to report")
 
 
-# ── RAG-powered answer ───────────────────────────────────────────────
-
-def ask_casey(question: str, history: list = []) -> str:
-    today = date.today().strftime("%B %d, %Y")
-
-    # For follow-up questions, augment the search query with the previous
-    # user message so ChromaDB has enough context to find the right docs.
-    search_query = question
-    if history:
-        last_user_msg = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
-        search_query = f"{last_user_msg} {question}"
-
-    relevant_docs = embedder.search(search_query, top_k=10)
-
-    # Hybrid retrieval: check search_query (which includes conversation context)
-    # so follow-up questions like "what were they working on?" also trigger
-    # the metadata filter when the thread is about expired/pending vendors.
-    query_context = search_query.lower()
-    if "expired" in query_context:
-        relevant_docs = list(dict.fromkeys(embedder.get_by_status("Expired") + relevant_docs))
-    elif "pending" in query_context:
-        relevant_docs = list(dict.fromkeys(embedder.get_by_status("Pending") + relevant_docs))
-
-    if not relevant_docs:
-        return "I don't have enough indexed data to answer that. Try asking me again in a moment."
-
-    context = "\n".join(f"- {doc}" for doc in relevant_docs)
-
-    history_instruction = (
-        "\nIMPORTANT: The conversation history above shows what was discussed before. "
-        "When the user says 'they', 'those', 'these vendors', 'that ticket', etc., "
-        "refer ONLY to the specific items mentioned in the previous messages — "
-        "do not include other items from the retrieved documents."
-        if history else ""
-    )
-
-    system_prompt = f"""You are Casey, a helpful Slack assistant for a Business Analyst.
-Today's date is {today}.
-
-The following documents were retrieved as most relevant to the user's question
-(via semantic search over vendor and sprint ticket data):
-
-{context}
-
-Answer using ONLY the information above. Be concise and use Slack-friendly formatting
-(*bold* for emphasis, bullet points with "-"). If the data isn't sufficient, say so honestly.
-{history_instruction}"""
-
-    # Build messages: system prompt + conversation history + new question
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(history)
-    messages.append({"role": "user", "content": question})
-
-    response = groq_client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=messages,
-        temperature=0.3,
-    )
-    return response.choices[0].message.content
-
-
 # ── Slack handlers ───────────────────────────────────────────────────
+
 
 @app.message("hello")
 def say_hello(message, say):
     blocks = [
         {
             "type": "header",
-            "text": {"type": "plain_text", "text": f"👋 Hey <@{message['user']}>, I'm Casey!", "emoji": True},
+            "text": {
+                "type": "plain_text",
+                "text": f"👋 Hey <@{message['user']}>, I'm Casey!",
+                "emoji": True,
+            },
         },
         {"type": "divider"},
         {
@@ -263,7 +390,7 @@ def say_hello(message, say):
                 "type": "mrkdwn",
                 "text": (
                     "I'm your AI-powered BA assistant. I can answer questions about your "
-                    "*vendors* and *sprint tickets* using semantic search.\n\n"
+                    "*vendors* and *sprint tickets* using real-time data.\n\n"
                     "*Try asking me:*\n"
                     "• _Which vendors have expired contracts?_\n"
                     "• _What's blocking the sprint?_\n"
@@ -274,23 +401,18 @@ def say_hello(message, say):
         {
             "type": "context",
             "elements": [
-                {"type": "mrkdwn", "text": "💡 Type *refresh* to sync latest data · *alert now* to trigger an alert check"}
+                {
+                    "type": "mrkdwn",
+                    "text": "💡 Type *alert now* to trigger an alert check",
+                }
             ],
         },
     ]
     say(blocks=blocks, text=f"Hey <@{message['user']}>, I'm Casey!")
 
 
-@app.message("refresh")
-def handle_refresh(message, say):
-    say("Refreshing my knowledge base... 🔄")
-    refresh_index()
-    say("Done! I'm up to date with the latest Notion and Jira data. ✅")
-
-
 @app.message("alert now")
 def handle_alert_now(message, say):
-    """Trigger an immediate alert check — useful for testing."""
     say("Running alert check now... 🔍")
     run_alerts()
     say("Alert check complete! Check the alerts channel. ✅")
@@ -299,17 +421,12 @@ def handle_alert_now(message, say):
 @app.message("")
 def handle_message(message, say):
     text = message["text"]
-
-    # thread_ts identifies the thread — use message ts if it's a new top-level message
     thread_ts = message.get("thread_ts", message["ts"])
-
-    # Retrieve existing history for this thread (empty list if new thread)
     history = conversation_memory.get(thread_ts, [])
 
     say(text="Thinking... 🤔", thread_ts=thread_ts)
     answer = ask_casey(text, history)
 
-    # Save this turn to memory (trim to last MAX_HISTORY turns)
     history.append({"role": "user", "content": text})
     history.append({"role": "assistant", "content": answer})
     conversation_memory[thread_ts] = history[-MAX_HISTORY:]
@@ -320,17 +437,11 @@ def handle_message(message, say):
 # ── Startup ──────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Build vector index
-    print("Building vector index from Notion + Jira data...")
-    refresh_index()
-
-    # Start background scheduler — runs alerts every hour
     scheduler = BackgroundScheduler()
     scheduler.add_job(run_alerts, "interval", hours=1, id="alerts")
     scheduler.start()
     print("[scheduler] Alert job scheduled — runs every hour")
 
-    # Run an immediate alert check on startup
     run_alerts()
 
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
